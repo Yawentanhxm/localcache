@@ -2,6 +2,7 @@ package localcache
 
 import (
 	"container/heap"
+	"encoding/json"
 	"fmt"
 	"localcache/priority_list"
 	"sync"
@@ -26,11 +27,29 @@ type MyCache struct {
 	curMemory uintptr //Byte
 	maxMemory uintptr //Byte
 	heap      priority_list.PriorityQueue
+	ch        <-chan time.Time
+}
+
+func NewCache() MyCache {
+	cache := MyCache{}
+	return cache
+}
+
+func (c *MyCache) timerExpr(key string, ch <-chan time.Time) {
+	for {
+		select {
+		case <-ch:
+			fmt.Printf("%s到定时时间\n", key)
+			c.Del(key)
+			return
+		}
+	}
 }
 
 type st struct {
-	data interface{}
-	st   *priority_list.Item
+	data interface{}         // 保存数据
+	st   *priority_list.Item //保存key和使用计数
+	//timer *time.Timer
 }
 
 func (c *MyCache) SetMaxMemory(size string) bool {
@@ -49,7 +68,10 @@ func (c *MyCache) SetMaxMemory(size string) bool {
 				a *= 1024 * 1024 * 1024
 			case "TB":
 				a *= 1024 * 1024 * 1024 * 1024
+			default:
+				a = 0
 			}
+			break
 		}
 	}
 	c.maxMemory = uintptr(a)
@@ -58,6 +80,7 @@ func (c *MyCache) SetMaxMemory(size string) bool {
 }
 
 // todo 支持过期时间
+// 加锁
 func (c *MyCache) Set(key string, val interface{}, expire time.Duration) bool {
 
 	item := &priority_list.Item{
@@ -68,15 +91,20 @@ func (c *MyCache) Set(key string, val interface{}, expire time.Duration) bool {
 		data: val,
 		st:   item,
 	}
+	timers := time.NewTimer(expire)
 	c.data.Store(key, st)
+	go c.timerExpr(key, timers.C)
 	heap.Push(&c.heap, item)
-	newSize := unsafe.Sizeof(st)
+	// todo 覆盖写的时候，Size不是累加
+	bytes, _ := json.Marshal(st)
+	newSize := unsafe.Sizeof(bytes)
 	for c.curMemory+newSize > c.maxMemory {
 		pop := heap.Pop(&c.heap)
 		if pop == nil {
 			return false
 		}
-		c.curMemory -= unsafe.Sizeof(pop)
+		bytes, _ := json.Marshal(pop)
+		c.curMemory -= unsafe.Sizeof(bytes)
 	}
 	c.curMemory += newSize
 	return true
@@ -92,20 +120,35 @@ func (c *MyCache) Get(key string) (interface{}, bool) {
 }
 
 func (c *MyCache) Del(key string) bool {
-	panic("implement me")
+	if value, ok := c.data.Load(key); ok {
+		// 内存计数修改
+		c.curMemory -= unsafe.Sizeof(value)
+		// map中删除
+		c.data.Delete(key)
+		// 优先队列中删除
+		heap.Remove(&c.heap, value.(*st).st.Index)
+		return true
+	}
+	return false
 }
 
 func (c *MyCache) Exists(key string) bool {
-	panic("implement me")
+	_, ok := c.data.Load(key)
+	return ok
 }
 
 func (c *MyCache) Flush() bool {
-	panic("implement me")
+	c.curMemory = 0
+	// 直接指向一个新的
+	c.heap = priority_list.PriorityQueue{}
+	c.data = sync.Map{}
+	return true
 }
 
 func (c *MyCache) Keys() int64 {
-	panic("implement me")
+	return int64(c.heap.Len())
 }
+
 func (c *MyCache) Print() {
 	for _, v := range c.heap {
 		fmt.Println(v)
